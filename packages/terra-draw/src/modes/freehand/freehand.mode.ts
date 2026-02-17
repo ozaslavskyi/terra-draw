@@ -60,8 +60,9 @@ const defaultCursors = {
 	close: "pointer",
 } as Required<Cursors>;
 
-interface TerraDrawFreehandModeOptions<T extends CustomStyling>
-	extends BaseModeOptions<T> {
+interface TerraDrawFreehandModeOptions<
+	T extends CustomStyling,
+> extends BaseModeOptions<T> {
 	minDistance?: number;
 	preventPointsNearClose?: boolean;
 	autoClose?: boolean;
@@ -84,6 +85,7 @@ export class TerraDrawFreehandMode extends TerraDrawBaseDrawMode<FreehandPolygon
 	private autoCloseTimeout = 500;
 	private hasLeftStartingPoint = false;
 	private preventNewFeature = false;
+	private isDrawing = false;
 
 	// Behaviors
 	private mutateFeature!: MutateFeatureBehavior;
@@ -153,6 +155,7 @@ export class TerraDrawFreehandMode extends TerraDrawBaseDrawMode<FreehandPolygon
 		this.currentId = undefined;
 		this.closingPointId = undefined;
 		this.hasLeftStartingPoint = false;
+		this.isDrawing = false;
 		// Go back to started state
 		if (this.state === "drawing") {
 			this.setStarted();
@@ -250,52 +253,151 @@ export class TerraDrawFreehandMode extends TerraDrawBaseDrawMode<FreehandPolygon
 	}
 
 	/** @internal */
-	onClick(event: TerraDrawMouseEvent) {
+	onClick(event: TerraDrawMouseEvent) {}
+
+	/** @internal */
+	onDragStart(
+		event: TerraDrawMouseEvent,
+		setMapDraggability: (enabled: boolean) => void,
+	) {
+		if (!this.allowPointerEvent(this.pointerEvents.onDragStart, event)) {
+			return;
+		}
+
+		if (this.preventNewFeature) {
+			return;
+		}
+
+		if (this.currentId === undefined) {
+			const { id: createdId } = this.mutateFeature.createPolygon({
+				coordinates: [
+					[event.lng, event.lat],
+					[event.lng, event.lat],
+					[event.lng, event.lat],
+					[event.lng, event.lat],
+				],
+				properties: {
+					mode: this.mode,
+					[COMMON_PROPERTIES.CURRENTLY_DRAWING]: true,
+				},
+			});
+			this.currentId = createdId;
+
+			this.closingPointId = this.mutateFeature.createGuidancePoint({
+				coordinate: [event.lng, event.lat],
+				type: COMMON_PROPERTIES.CLOSING_POINT,
+			});
+
+			this.canClose = true;
+			this.isDrawing = true;
+
+			// We could already be in drawing due to updating the existing polygon
+			// via afterFeatureUpdated
+			if (this.state !== "drawing") {
+				this.setDrawing();
+			}
+
+			setMapDraggability(false);
+		}
+	}
+
+	/** @internal */
+	onDrag(
+		event: TerraDrawMouseEvent,
+		setMapDraggability: (enabled: boolean) => void,
+	) {
 		if (
-			(event.button === "right" &&
-				this.allowPointerEvent(this.pointerEvents.rightClick, event)) ||
-			(event.button === "left" &&
-				this.allowPointerEvent(this.pointerEvents.leftClick, event)) ||
-			(event.isContextMenu &&
-				this.allowPointerEvent(this.pointerEvents.contextMenu, event))
+			!this.allowPointerEvent(this.pointerEvents.onDrag, event) ||
+			!this.isDrawing
 		) {
-			if (this.preventNewFeature) {
-				return;
+			return;
+		}
+
+		if (this.currentId === undefined || this.canClose === false) {
+			this.setCursor(this.cursors.start);
+			return;
+		}
+
+		const [previousLng, previousLat] = this.readFeature.getCoordinate(
+			this.currentId,
+			-2,
+		);
+		const { x, y } = this.project(previousLng, previousLat);
+		const distance = cartesianDistance(
+			{ x, y },
+			{ x: event.containerX, y: event.containerY },
+		);
+
+		const [closingLng, closingLat] = this.readFeature.getCoordinate(
+			this.currentId,
+			0,
+		);
+		const { x: closingX, y: closingY } = this.project(closingLng, closingLat);
+		const closingDistance = cartesianDistance(
+			{ x: closingX, y: closingY },
+			{ x: event.containerX, y: event.containerY },
+		);
+
+		if (closingDistance < this.pointerDistance) {
+			// We only want to close the polygon if the users cursor has left the
+			// region of the starting point
+			if (this.autoClose && this.hasLeftStartingPoint) {
+				// If we have an autoCloseTimeout, we want to prevent new features
+				// being created by accidental clicks for a short period of time
+				this.preventNewFeature = true;
+				setTimeout(() => {
+					this.preventNewFeature = false;
+				}, this.autoCloseTimeout);
+
+				this.close();
 			}
 
-			if (this.canClose === false) {
-				const { id: createdId } = this.mutateFeature.createPolygon({
-					coordinates: [
-						[event.lng, event.lat],
-						[event.lng, event.lat],
-						[event.lng, event.lat],
-						[event.lng, event.lat],
-					],
-					properties: {
-						mode: this.mode,
-						[COMMON_PROPERTIES.CURRENTLY_DRAWING]: true,
-					},
-				});
-				this.currentId = createdId;
+			this.setCursor(this.cursors.close);
 
-				this.closingPointId = this.mutateFeature.createGuidancePoint({
+			// We want to prohibit drawing new points at or around the closing
+			// point as it can be non user friendly
+			if (this.preventPointsNearClose) {
+				return;
+			}
+		} else {
+			this.hasLeftStartingPoint = true;
+			this.setCursor(this.cursors.start);
+		}
+
+		// The cursor must have moved a minimum distance
+		// before we add another coordinate
+		if (distance < this.minDistance) {
+			return;
+		}
+
+		this.mutateFeature.updatePolygon({
+			featureId: this.currentId,
+			coordinateMutations: [
+				{
+					type: Mutations.InsertBefore,
+					index: -1,
 					coordinate: [event.lng, event.lat],
-					type: COMMON_PROPERTIES.CLOSING_POINT,
-				});
+				},
+			],
+			context: { updateType: UpdateTypes.Provisional },
+		});
+	}
 
-				this.canClose = true;
+	/** @internal */
+	onDragEnd(
+		event: TerraDrawMouseEvent,
+		setMapDraggability: (enabled: boolean) => void,
+	) {
+		if (!this.allowPointerEvent(this.pointerEvents.onDragEnd, event)) {
+			return;
+		}
 
-				// We could already be in drawing due to updating the existing polygon
-				// via afterFeatureUpdated
-				if (this.state !== "drawing") {
-					this.setDrawing();
-				}
-
-				return;
-			}
-
+		if (this.isDrawing && this.currentId !== undefined) {
+			// Auto-close the polygon when drag ends
 			this.close();
 		}
+
+		setMapDraggability(true);
 	}
 
 	/** @internal */
@@ -313,15 +415,6 @@ export class TerraDrawFreehandMode extends TerraDrawBaseDrawMode<FreehandPolygon
 	}
 
 	/** @internal */
-	onDragStart() {}
-
-	/** @internal */
-	onDrag() {}
-
-	/** @internal */
-	onDragEnd() {}
-
-	/** @internal */
 	cleanUp() {
 		const cleanUpId = this.currentId;
 		const cleanUpClosingPointId = this.closingPointId;
@@ -329,6 +422,7 @@ export class TerraDrawFreehandMode extends TerraDrawBaseDrawMode<FreehandPolygon
 		this.closingPointId = undefined;
 		this.currentId = undefined;
 		this.canClose = false;
+		this.isDrawing = false;
 		if (this.state === "drawing") {
 			this.setStarted();
 		}
@@ -446,6 +540,7 @@ export class TerraDrawFreehandMode extends TerraDrawBaseDrawMode<FreehandPolygon
 			this.currentId = undefined;
 			this.closingPointId = undefined;
 			this.hasLeftStartingPoint = false;
+			this.isDrawing = false;
 		}
 	}
 
